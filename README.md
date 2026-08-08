@@ -2,7 +2,8 @@
 
 `Codex Usage` is a Tildagon 2026 dashboard for the weekly and optional
 five-hour Codex usage windows. Percentages show allowance remaining and reset
-times are always rendered in fixed GMT (UTC+00:00).
+times follow the host computer's local timezone; the timezone suffix is hidden
+on the badge.
 
 The badge never receives OpenAI credentials. `bridge.py` uses the locally
 authenticated Codex CLI and exposes only the normalized usage snapshot through

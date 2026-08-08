@@ -2,7 +2,7 @@
 """Read Codex usage from the local app-server and serve a badge-safe view."""
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -122,8 +122,8 @@ class CodexAppServer:
 def _reset_label(timestamp):
     if not isinstance(timestamp, int):
         return "RESET UNKNOWN"
-    value = datetime.fromtimestamp(timestamp, timezone.utc)
-    return "%s %02d %s · %02d:%02d GMT" % (
+    value = datetime.fromtimestamp(timestamp).astimezone()
+    return "%s %02d %s · %02d:%02d" % (
         WEEKDAYS[value.weekday()],
         value.day,
         MONTHS[value.month - 1],
@@ -183,7 +183,7 @@ def normalize_rate_limits(result, fetched_at=None):
     return {
         "schema_version": SCHEMA_VERSION,
         "fetched_at": int(time.time()) if fetched_at is None else int(fetched_at),
-        "timezone": "GMT",
+        "timezone": "host-local",
         "windows": windows,
     }
 

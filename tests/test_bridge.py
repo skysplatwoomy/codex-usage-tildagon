@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from pathlib import Path
 import sys
 import threading
@@ -47,13 +48,22 @@ def sample_response():
 
 
 class NormalizeTests(unittest.TestCase):
-    def test_normalizes_and_orders_weekly_first_in_gmt(self):
+    def test_normalizes_and_orders_weekly_first_in_host_timezone(self):
         payload = bridge.normalize_rate_limits(sample_response(), fetched_at=123)
-        self.assertEqual(payload["timezone"], "GMT")
+        self.assertEqual(payload["timezone"], "host-local")
         self.assertEqual(payload["fetched_at"], 123)
         self.assertEqual([row["kind"] for row in payload["windows"]], ["weekly", "five_hour"])
         self.assertEqual(payload["windows"][0]["remaining_percent"], 18)
-        self.assertTrue(payload["windows"][0]["reset_label"].endswith(" GMT"))
+        local = datetime.fromtimestamp(1786357800).astimezone()
+        expected = "%s %02d %s · %02d:%02d" % (
+            bridge.WEEKDAYS[local.weekday()],
+            local.day,
+            bridge.MONTHS[local.month - 1],
+            local.hour,
+            local.minute,
+        )
+        self.assertEqual(payload["windows"][0]["reset_label"], expected)
+        self.assertNotIn("GMT", payload["windows"][0]["reset_label"])
 
     def test_falls_back_to_compatibility_bucket_and_order(self):
         payload = bridge.normalize_rate_limits(
@@ -100,7 +110,7 @@ class HttpTests(unittest.TestCase):
     def setUp(self):
         class Provider:
             def fetch(self):
-                return {"schema_version": 1, "timezone": "GMT", "windows": []}
+                return {"schema_version": 1, "timezone": "host-local", "windows": []}
 
         self.server = bridge.ThreadingHTTPServer(
             ("127.0.0.1", 0), bridge.make_handler(Provider(), "test-token")
