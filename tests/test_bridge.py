@@ -1,6 +1,9 @@
 import json
 from datetime import datetime
+import hashlib
+import hmac
 from pathlib import Path
+import socket
 import sys
 import threading
 import unittest
@@ -134,6 +137,55 @@ class HttpTests(unittest.TestCase):
         with urlopen(request, timeout=2) as response:
             payload = json.load(response)
         self.assertEqual(payload["schema_version"], 1)
+
+
+class DiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.server = bridge.DiscoveryServer(
+            "test-token", 8765, 0, bind="127.0.0.1"
+        )
+        self.server.start()
+
+    def tearDown(self):
+        self.server.close()
+
+    def test_replies_with_source_bound_authenticated_address(self):
+        nonce = "0011223344556677"
+        request = json.dumps(
+            {
+                "type": bridge.DISCOVERY_REQUEST_TYPE,
+                "version": bridge.DISCOVERY_VERSION,
+                "nonce": nonce,
+            }
+        ).encode()
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client.settimeout(2)
+        try:
+            client.sendto(request, ("127.0.0.1", self.server.port))
+            raw, source = client.recvfrom(1024)
+        finally:
+            client.close()
+
+        payload = json.loads(raw)
+        self.assertEqual(source[0], "127.0.0.1")
+        self.assertEqual(payload["host"], source[0])
+        self.assertEqual(payload["port"], 8765)
+        self.assertEqual(payload["nonce"], nonce)
+        message = bridge.discovery_proof_message(nonce, source[0], 8765)
+        expected = hmac.new(
+            b"test-token", message.encode(), hashlib.sha256
+        ).hexdigest()
+        self.assertEqual(payload["proof"], expected)
+
+    def test_ignores_malformed_requests(self):
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client.settimeout(0.2)
+        try:
+            client.sendto(b"not-json", ("127.0.0.1", self.server.port))
+            with self.assertRaises(socket.timeout):
+                client.recvfrom(1024)
+        finally:
+            client.close()
 
 
 if __name__ == "__main__":
