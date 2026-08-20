@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 import importlib.util
 from pathlib import Path
 import sys
@@ -51,19 +53,6 @@ class FakeBaseApp:
 
     def minimise(self):
         self.minimised = True
-
-
-class FakeResponse:
-    def __init__(self, payload, status_code=200):
-        self.payload = payload
-        self.status_code = status_code
-        self.closed = False
-
-    def json(self):
-        return self.payload
-
-    def close(self):
-        self.closed = True
 
 
 class FakeCtx:
@@ -128,10 +117,19 @@ settings_state = {
     "codex_usage": {
         "bridge_url": "http://192.0.2.1:8765/",
         "bridge_token": "secret",
+        "discovery_port": 8766,
+        "http_timeout_seconds": 8,
         "refresh_seconds": 60,
     }
 }
-request_state = {"response": None, "exception": None, "calls": []}
+network_state = {
+    "url": "http://192.0.2.55:8765",
+    "payload": None,
+    "discovery_exception": None,
+    "fetch_exception": None,
+    "discovery_calls": [],
+    "fetch_calls": [],
+}
 
 
 def sample_payload(two=True):
@@ -172,17 +170,6 @@ def install_stubs():
     wifi_module.async_wait = async_wait
     sys.modules["wifi"] = wifi_module
 
-    requests_module = types.ModuleType("requests")
-
-    def get(url, headers=None):
-        request_state["calls"].append((url, headers))
-        if request_state["exception"]:
-            raise request_state["exception"]
-        return request_state["response"]
-
-    requests_module.get = get
-    sys.modules["requests"] = requests_module
-
     helpers = types.ModuleType("async_helpers")
 
     async def unblock(function, periodic, *args, **kwargs):
@@ -209,6 +196,20 @@ usage_app = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(usage_app)
 
 
+def fake_discover(token, discovery_port):
+    network_state["discovery_calls"].append((token, discovery_port))
+    if network_state["discovery_exception"]:
+        raise network_state["discovery_exception"]
+    return network_state["url"]
+
+
+def fake_fetch(url, token, timeout_seconds):
+    network_state["fetch_calls"].append((url, token, timeout_seconds))
+    if network_state["fetch_exception"]:
+        raise network_state["fetch_exception"]
+    return network_state["payload"]
+
+
 async def render_update():
     return None
 
@@ -221,11 +222,18 @@ class AppTests(unittest.TestCase):
         settings_state["codex_usage"] = {
             "bridge_url": "http://192.0.2.1:8765/",
             "bridge_token": "secret",
+            "discovery_port": 8766,
+            "http_timeout_seconds": 8,
             "refresh_seconds": 60,
         }
-        request_state["response"] = None
-        request_state["exception"] = None
-        request_state["calls"] = []
+        network_state["url"] = "http://192.0.2.55:8765"
+        network_state["payload"] = sample_payload()
+        network_state["discovery_exception"] = None
+        network_state["fetch_exception"] = None
+        network_state["discovery_calls"] = []
+        network_state["fetch_calls"] = []
+        usage_app._discover_bridge = fake_discover
+        usage_app._fetch_usage_json = fake_fetch
 
     def test_accepts_weekly_and_optional_five_hour(self):
         application = usage_app.CodexUsageApp()
@@ -243,20 +251,20 @@ class AppTests(unittest.TestCase):
             application._accept_payload({"schema_version": 9, "windows": []})
         self.assertIn("weekly", application.windows)
 
-    def test_refresh_closes_response_and_uses_bearer(self):
-        response = FakeResponse(sample_payload())
-        request_state["response"] = response
+    def test_refresh_discovers_bridge_and_uses_shared_token(self):
         application = usage_app.CodexUsageApp()
         asyncio.run(application._refresh(render_update))
-        self.assertTrue(response.closed)
         self.assertFalse(application.stale)
-        self.assertEqual(request_state["calls"][0][0], "http://192.0.2.1:8765/v1/usage")
-        self.assertEqual(request_state["calls"][0][1]["Authorization"], "Bearer secret")
+        self.assertEqual(network_state["discovery_calls"], [("secret", 8766)])
+        self.assertEqual(
+            network_state["fetch_calls"],
+            [("http://192.0.2.55:8765", "secret", 8)],
+        )
 
     def test_failure_keeps_data_and_marks_it_stale(self):
         application = usage_app.CodexUsageApp()
         application._accept_payload(sample_payload())
-        request_state["exception"] = OSError("offline")
+        network_state["fetch_exception"] = OSError("offline")
         asyncio.run(application._refresh(render_update))
         self.assertTrue(application.stale)
         self.assertEqual(application.error, "OFFLINE")
@@ -266,8 +274,41 @@ class AppTests(unittest.TestCase):
         settings_state["codex_usage"] = {}
         application = usage_app.CodexUsageApp()
         asyncio.run(application._refresh(render_update))
-        self.assertEqual(application.error, "SET BRIDGE CONFIG")
-        self.assertEqual(request_state["calls"], [])
+        self.assertEqual(application.error, "SET BRIDGE TOKEN")
+        self.assertEqual(network_state["discovery_calls"], [])
+        self.assertEqual(network_state["fetch_calls"], [])
+
+    def test_discovery_proof_matches_standard_hmac_and_binds_source_ip(self):
+        nonce = "0011223344556677"
+        host = "192.0.2.55"
+        port = 8765
+        message = usage_app._discovery_proof_message(nonce, host, port)
+        proof = hmac.new(b"secret", message.encode(), hashlib.sha256).hexdigest()
+        payload = {
+            "type": usage_app.DISCOVERY_RESPONSE_TYPE,
+            "version": usage_app.DISCOVERY_VERSION,
+            "nonce": nonce,
+            "host": host,
+            "port": port,
+            "proof": proof,
+        }
+        self.assertEqual(
+            usage_app._validated_discovery_url(
+                payload, (host, 8766), "secret", nonce
+            ),
+            "http://192.0.2.55:8765",
+        )
+        self.assertIsNone(
+            usage_app._validated_discovery_url(
+                payload, ("192.0.2.99", 8766), "secret", nonce
+            )
+        )
+        payload["proof"] = "0" * 64
+        self.assertIsNone(
+            usage_app._validated_discovery_url(
+                payload, (host, 8766), "secret", nonce
+            )
+        )
 
     def test_manual_and_timed_refresh_and_cancel(self):
         application = usage_app.CodexUsageApp()

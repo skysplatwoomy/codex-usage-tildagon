@@ -3,18 +3,26 @@
 
 import argparse
 from datetime import datetime
+import hashlib
+import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import secrets
 import selectors
+import socket
 import subprocess
 import threading
 import time
 
 
 SCHEMA_VERSION = 1
+DISCOVERY_VERSION = 1
+DISCOVERY_REQUEST_TYPE = "codex_usage_discover"
+DISCOVERY_RESPONSE_TYPE = "codex_usage_bridge"
+DISCOVERY_PROOF_PREFIX = "CODEX_USAGE_DISCOVERY_V1"
+DEFAULT_DISCOVERY_PORT = 8766
 WEEKDAYS = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
 
@@ -200,6 +208,94 @@ class UsageProvider:
             return normalize_rate_limits(self.app_server.read_rate_limits())
 
 
+def discovery_proof_message(nonce, host, port):
+    return "%s\n%s\n%s\n%d" % (DISCOVERY_PROOF_PREFIX, nonce, host, port)
+
+
+def discovery_proof(token, nonce, host, port):
+    return hmac.new(
+        token.encode("utf-8"),
+        discovery_proof_message(nonce, host, port).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def build_discovery_response(token, nonce, host, port):
+    return {
+        "type": DISCOVERY_RESPONSE_TYPE,
+        "version": DISCOVERY_VERSION,
+        "nonce": nonce,
+        "host": host,
+        "port": port,
+        "proof": discovery_proof(token, nonce, host, port),
+    }
+
+
+def _local_ip_for_peer(peer):
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(peer)
+        return probe.getsockname()[0]
+    finally:
+        probe.close()
+
+
+class DiscoveryServer:
+    def __init__(self, token, http_port, discovery_port, bind="0.0.0.0"):
+        self.token = token
+        self.http_port = http_port
+        self.stop_event = threading.Event()
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind((bind, discovery_port))
+        self.socket.settimeout(0.5)
+        self.port = self.socket.getsockname()[1]
+        self.thread = threading.Thread(
+            target=self._serve, name="codex-usage-discovery", daemon=True
+        )
+
+    def start(self):
+        self.thread.start()
+
+    def close(self):
+        self.stop_event.set()
+        self.socket.close()
+        if self.thread.is_alive():
+            self.thread.join(timeout=2)
+
+    def _serve(self):
+        while not self.stop_event.is_set():
+            try:
+                raw, peer = self.socket.recvfrom(1024)
+            except (OSError, socket.timeout):
+                continue
+
+            try:
+                request = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if not isinstance(request, dict):
+                continue
+            if request.get("type") != DISCOVERY_REQUEST_TYPE:
+                continue
+            if request.get("version") != DISCOVERY_VERSION:
+                continue
+            nonce = request.get("nonce")
+            if not isinstance(nonce, str) or not 8 <= len(nonce) <= 128:
+                continue
+
+            try:
+                host = _local_ip_for_peer(peer)
+                response = build_discovery_response(
+                    self.token, nonce, host, self.http_port
+                )
+                body = json.dumps(response, separators=(",", ":")).encode("utf-8")
+                self.socket.sendto(body, peer)
+            except OSError:
+                if self.stop_event.is_set():
+                    return
+
+
 def make_handler(provider, token):
     class UsageHandler(BaseHTTPRequestHandler):
         server_version = "CodexUsageBridge/1.0"
@@ -248,9 +344,16 @@ def parse_args(argv=None):
     local = _load_local_config()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--bind", default=local.get("bind", "127.0.0.1"), help="LAN address to bind"
+        "--bind",
+        default=local.get("bind", "0.0.0.0"),
+        help="address to bind (default: all current and future interfaces)",
     )
     parser.add_argument("--port", type=int, default=int(local.get("port", 8765)))
+    parser.add_argument(
+        "--discovery-port",
+        type=int,
+        default=int(local.get("discovery_port", DEFAULT_DISCOVERY_PORT)),
+    )
     parser.add_argument(
         "--token", default=os.environ.get("CODEX_USAGE_TOKEN", local.get("token"))
     )
@@ -265,12 +368,20 @@ def main(argv=None):
     app_server = CodexAppServer(args.codex_command)
     provider = UsageProvider(app_server)
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(provider, args.token))
+    try:
+        discovery = DiscoveryServer(args.token, args.port, args.discovery_port)
+    except Exception:
+        server.server_close()
+        raise
+    discovery.start()
     print("Codex usage bridge listening on http://%s:%d" % (args.bind, args.port))
+    print("Codex usage discovery listening on UDP %d" % discovery.port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        discovery.close()
         server.server_close()
         app_server.close()
 
